@@ -23,6 +23,7 @@ Buffer cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack s
 void cbt_insert_tuple(Relation index, uint32 position, ItemPointer itmptr);
 void cbt_insert_on_page(Relation index, CBTStack stack, CBTTuple newtup, Buffer *buf);
 void cbt_change_parent(CBTStack stack, Relation rel, int change);
+uint32 cbt_find_totalcnt(Relation index);
 
 
 /*
@@ -96,6 +97,9 @@ cbt_insert_tuple(Relation index, uint32 position, ItemPointer itmptr)
     Buffer              insertionbuf;
     CBTTuple            itup;
     CBTStack            stack;
+
+	/* Sanity check that position is a positive integer. */
+	Assert (position > 0);
 
     stack = cbt_search(index, position, &insertionbuf, CBT_WRITE);
 
