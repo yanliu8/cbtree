@@ -1,0 +1,5 @@
+# cbtree extension
+comment = 'counted btree access method'
+default_version = '1.0'
+module_pathname = '$libdir/cbtree'
+relocatable = true
