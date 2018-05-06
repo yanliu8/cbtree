@@ -28,6 +28,7 @@ typedef struct CBTPageOpaqueData
 {
     BlockNumber cbto_prev;
     BlockNumber cbto_next;
+	ItemPointerData cbto_parent;
     uint32      level;
     uint16      cbto_flags;
 

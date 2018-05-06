@@ -68,7 +68,6 @@ cbtbuild(Relation heap, Relation index, IndexInfo *indexInfo)
     double              reltuples;
     IndexBuildResult    *result;
 
-
     if (RelationGetNumberOfBlocks(index) != 0)
         elog(ERROR, "index \"%s\" already contains data",
              RelationGetRelationName(index));
@@ -213,6 +212,7 @@ cbt_build_add_tuple(CBTBuildState *state, CBTPageState *pagestate, CBTTuple newt
         Page		    opage = page;
         Page            npage;
         CBTPageState    *opagestate = pagestate;
+        CBTPageOpaque   opaque = (CBTPageOpaque )PageGetSpecialPointer(page);
         BlockNumber     oblkno = pagestate->cbtps_blockno;
         ItemPointerData self_itemptr;
         CBTTuple        parenttuple;
@@ -233,6 +233,7 @@ cbt_build_add_tuple(CBTBuildState *state, CBTPageState *pagestate, CBTTuple newt
         ItemPointerSet(&self_itemptr, oblkno, P_FIRSTOFFSET);
         CBTFormTuple(&self_itemptr, parenttuple, opagestate->total_count);
         cbt_build_add_tuple(state, opagestate->cbtps_parent, parenttuple);
+        ItemPointerSet(&opaque->cbto_parent, opagestate->cbtps_parent->cbtps_blockno, opagestate->cbtps_parent->cbtps_lastoff);
 
         /* Create new page of same level and update pagestate at this level*/
         cbt_init_pagestate(pagestate, state, pagestate->cbtps_level);
@@ -358,6 +359,7 @@ cbt_newpage(uint32 level)
     /* Initialize BT opaque state */
     opaque = (CBTPageOpaque) PageGetSpecialPointer(page);
     opaque->cbto_prev = opaque->cbto_next = InvalidBlockNumber;
+    ItemPointerSet(&opaque->cbto_parent, InvalidBlockNumber, InvalidOffsetNumber);
     opaque->level = level;
 
     return page;

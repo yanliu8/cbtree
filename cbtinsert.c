@@ -177,6 +177,27 @@ cbt_insert_on_page(Relation index, CBTStack stack, CBTTuple newtup, Buffer *buf)
     }
 }
 
+void
+cbt_change_children(Relation rel, ItemPointer child, BlockNumber parentblkno, OffsetNumber parentoffset)
+{
+    Buffer          childbuf;
+    Page            page;
+    CBTPageOpaque   opaque;
+
+    childbuf = cbt_get_buffer(rel, ItemPointerGetBlockNumber(child), CBT_WRITE);
+    page = BufferGetPage(childbuf);
+    opaque = (CBTPageOpaque )PageGetSpecialPointer(page);
+
+    START_CRIT_SECTION();
+
+    ItemPointerSet(&opaque->cbto_parent, parentblkno, parentoffset);
+    MarkBufferDirty(childbuf);
+
+    END_CRIT_SECTION();
+
+    UnlockReleaseBuffer(childbuf);
+}
+
 /*
  * Change children count in parents.
  * This function will trace down stack and add change
@@ -242,7 +263,9 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
     OffsetNumber i;
     OffsetNumber firstright;
     OffsetNumber newitemoff = stack->cbts_offset;
+    OffsetNumber newitemoffonpage = InvalidOffsetNumber;
     bool        newitemonleft;
+    bool        is_leaf;
     CBTTuple    parenttuple;
     CBTTuple    newparenttuple;
     ItemPointerData ritemptr;
@@ -290,7 +313,6 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
 
     /* if we're splitting this page, it won't be the root when we're done */
     /* also, clear the SPLIT_END and HAS_GARBAGE flags in both pages */
-    // TODO: clear root flag
     lopaque->cbto_flags = oopaque->cbto_flags;
     lopaque->cbto_flags &= ~CBT_ROOT;
     ropaque->cbto_flags = lopaque->cbto_flags;
@@ -308,6 +330,7 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
      * Note: we *must* insert at least the right page's items in item-number
      * order, for the benefit of _bt_restore_page().
      */
+    //@TODO: handle children's backward pointer when splitting
     maxoff = PageGetMaxOffsetNumber(origpage);
     newitemonleft = (newitemoff <= (maxoff / 2));
     firstright = maxoff / 2 + 1;
@@ -315,24 +338,31 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
     itemsz = MAXALIGN(itemsz);
     leftoff = rightoff = P_FIRSTOFFSET;
     leftcount = rightcount = 0;
+    is_leaf = P_ISLEAF(oopaque);
 
     for (i = P_FIRSTOFFSET; i <= maxoff; i = OffsetNumberNext(i))
     {
         itemid = PageGetItemId(origpage, i);
         item = (CBTTuple) PageGetItem(origpage, itemid);
 
-        /* does new item belong before this one? */
+        /*
+         * Insert new tuples to the correct page
+         * Updating children backward pointer is not necessary since it will
+         * be done in children's iteration
+         */
         if (i == newitemoff)
         {
             if (newitemonleft)
             {
                 PageAddItem(leftpage, (Item) newitem, itemsz, leftoff, false, false);
+                newitemoff = leftoff;
                 leftoff = OffsetNumberNext(leftoff);
                 leftcount += newitem->childcnt;
             }
             else
             {
                 PageAddItem(rightpage, (Item) newitem, itemsz, rightoff, false, false);
+                newitemoff = rightoff;
                 rightoff = OffsetNumberNext(rightoff);
                 rightcount += newitem->childcnt;
             }
@@ -342,12 +372,18 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
         if (i < firstright)
         {
             PageAddItem(leftpage, (Item) item, itemsz, leftoff, false, false);
+            /* Change the backward pointer in children's page */
+            if (!is_leaf)
+                cbt_change_children(rel, &item->itemptr, origpagenumber, leftoff);
             leftoff = OffsetNumberNext(leftoff);
             leftcount += item->childcnt;
         }
         else
         {
             PageAddItem(rightpage, (Item) item, itemsz, rightoff, false, false);
+            /* Change the backward pointer in children's page */
+            if (!is_leaf)
+                cbt_change_children(rel, &item->itemptr, rightpagenumber, rightoff);
             rightoff = OffsetNumberNext(rightoff);
             rightcount += item->childcnt;
         }
@@ -362,6 +398,7 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
          * not be splitting the page).
          */
         PageAddItem(rightpage, (Item) newitem, itemsz, rightoff, false, false);
+        newitemoff = rightoff;
         rightoff = OffsetNumberNext(rightoff);
         rightcount += item->childcnt;
     }
@@ -408,6 +445,7 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
         stack->cbts_parent->cbts_blkno = parentblkno;
         stack->cbts_parent->cbts_parent = NULL;
         cbt_insert_on_page(rel, stack->cbts_parent, parenttuple, &parent);
+        ItemPointerSet(&oopaque->cbto_parent, parentblkno, P_FIRSTOFFSET);
     }
     else
     {
@@ -422,6 +460,7 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
     CBTFormTuple(&ritemptr, newparenttuple, (uint32) rightcount);
     stack->cbts_parent->cbts_offset++;
     cbt_insert_on_page(rel, stack->cbts_parent, newparenttuple, &parent);
+    ItemPointerSet(&ropaque->cbto_parent, stack->cbts_parent->cbts_blkno, stack->cbts_parent->cbts_offset);
     UnlockReleaseBuffer(parent);
 
     /*
@@ -525,11 +564,15 @@ cbt_split_page(Relation rel, Buffer origbuf, CBTTuple newitem, CBTStack stack)
 
     if (newitemonleft)
     {
+        stack->cbts_blkno = origpagenumber;
+        stack->cbts_offset = newitemoff;
         UnlockReleaseBuffer(rbuf);
         return origbuf;
     }
     else
     {
+        stack->cbts_blkno = rightpagenumber;
+        stack->cbts_offset = newitemoff;
         UnlockReleaseBuffer(origbuf);
         return rbuf;
     }
@@ -556,32 +599,10 @@ cbt_get_buffer(Relation rel, BlockNumber blkno, int access)
 
         Assert(access == CBT_WRITE);
 
-        /*
-         * Extend the relation by one page.
-         *
-         * We have to use a lock to ensure no one else is extending the rel at
-         * the same time, else we will both try to initialize the same new
-         * page.  We can skip locking for new or temp relations, however,
-         * since no one else could be accessing them.
-         */
-        needLock = !RELATION_IS_LOCAL(rel);
-
-        if (needLock)
-            LockRelationForExtension(rel, ExclusiveLock);
-
         buf = ReadBuffer(rel, P_NEW);
 
         /* Acquire buffer lock on new page */
         LockBuffer(buf, CBT_WRITE);
-
-        /*
-         * Release the file-extension lock; it's now OK for someone else to
-         * extend the relation some more.  Note that we cannot release this
-         * lock before we have buffer lock on the new page, or we risk a race
-         * condition against btvacuumscan --- see comments therein.
-         */
-        if (needLock)
-            UnlockRelationForExtension(rel, ExclusiveLock);
 
         /* Initialize the new page before returning it */
         page = BufferGetPage(buf);
